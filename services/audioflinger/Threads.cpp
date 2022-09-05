@@ -50,6 +50,7 @@
 #include <binder/PersistableBundle.h>
 #include <com_android_media_audio.h>
 #include <com_android_media_audioserver.h>
+#include <set>
 #include <cutils/bitops.h>
 #include <cutils/properties.h>
 #include <fastpath/AutoPark.h>
@@ -2789,6 +2790,43 @@ ssize_t PlaybackThread::Tracks<T>::remove(const sp<T>& track)
         }
     }
     return index;
+}
+
+void PlaybackThread::listAppVolumes(std::set<media::AppVolume> &container)
+{
+    audio_utils::lock_guard _l(mutex());
+    for (sp<IAfTrack> track : mTracks) {
+        if (!track->getPackageName().empty()) {
+            media::AppVolume av;
+            av.packageName = track->getPackageName();
+            av.muted = track->isAppMuted();
+            av.volume = track->getAppVolume();
+            av.active = mActiveTracks.indexOf(track) >= 0;
+            container.insert(av);
+        }
+    }
+}
+
+status_t PlaybackThread::setAppVolume(const String8& packageName, const float value)
+{
+    audio_utils::lock_guard _l(mutex());
+    for (sp<IAfTrack> track : mTracks) {
+        if (packageName == track->getPackageName()) {
+            track->setAppVolume(value);
+        }
+    }
+    return NO_ERROR;
+}
+
+status_t PlaybackThread::setAppMute(const String8& packageName, const bool value)
+{
+    audio_utils::lock_guard _l(mutex());
+    for (sp<IAfTrack> track : mTracks) {
+        if (packageName == track->getPackageName()) {
+            track->setAppMute(value);
+        }
+    }
+    return NO_ERROR;
 }
 
 uint32_t PlaybackThread::correctLatency_l(uint32_t latency) const
@@ -5834,10 +5872,12 @@ PlaybackThread::mixer_state MixerThread::prepareTracks_l(
                         volume = masterVolume * mStreamTypes[track->streamType()].volume;
                     }
                 } else {
-                    if (track->isPlaybackRestricted()) {
-                        volume = 0.f;
-                    } else {
-                        volume = masterVolume * track->getPortVolume();
+                if (track->isPlaybackRestricted() ||
+                        mStreamTypes[track->streamType()].mute || track->isAppMuted()) {
+                    volume = 0.f;
+                } else {
+                    volume = masterVolume * mStreamTypes[track->streamType()].volume
+                                          * track->getAppVolume();
                     }
                 }
                 handleVoipVolume_l(&volume);
@@ -6018,6 +6058,8 @@ PlaybackThread::mixer_state MixerThread::prepareTracks_l(
             uint32_t vl, vr;       // in U8.24 integer format
             float vlf, vrf, vaf;   // in [0.0, 1.0] float format
             // read original volumes with volume control
+            float v = masterVolume * mStreamTypes[track->streamType()].volume
+                                   * track->getAppVolume();
             // Always fetch volumeshaper volume to ensure state is updated.
             const sp<AudioTrackServerProxy> proxy = track->audioTrackServerProxy();
             const float vh = track->getVolumeHandler()->getVolume(
@@ -6025,7 +6067,7 @@ PlaybackThread::mixer_state MixerThread::prepareTracks_l(
             float v;
             if (!audioserver_flags::portid_volume_management()) {
                 v = masterVolume * mStreamTypes[track->streamType()].volume;
-                if (mStreamTypes[track->streamType()].mute || track->isPlaybackRestricted()) {
+                if (mStreamTypes[track->streamType()].mute || track->isPlaybackRestricted() || track->isAppMuted()) {
                     v = 0;
                 }
             } else {
@@ -6797,10 +6839,11 @@ void DirectOutputThread::processVolume_l(IAfTrack* track, bool lastTrack)
 
     if (!audioserver_flags::portid_volume_management()) {
         if (mMasterMute || mStreamTypes[track->streamType()].mute ||
-            track->isPlaybackRestricted()) {
+            track->isPlaybackRestricted()|| track->isAppMuted()) {
             left = right = 0;
         } else {
             float typeVolume = mStreamTypes[track->streamType()].volume;
+            float appVolume = track->getAppVolume();
             const float v = mMasterVolume * typeVolume * shaperVolume;
 
             if (left > GAIN_FLOAT_UNITY) {
